@@ -4,7 +4,7 @@
   "version": "1.0.0",
   "config_flow": true,
   "dependencies": [],
-  "documentation" : "https://github.com/kenzo-bento/bridge-heat",
-  "issue-tracker" : "https://github.com/kenzo-bento/bridge-heat/issues",
-  "codeowners": ["@kenzo-bento"]
+  "documentation" : "https://github.com/labgeea/bridge-heat",
+  "issue-tracker" : "https://github.com/labgeea/bridge-heat/issues",
+  "codeowners": ["@labgeea", "@kenzo-bento"]
 }
