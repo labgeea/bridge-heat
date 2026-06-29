@@ -50,12 +50,12 @@ async def send_data(
 
     Args:
         samples:  List of dicts containing sensor readings.
-                  All values are strings except 'time' (a datetime object).
-                  An optional 'location' key may also be present per sample.
+        All values are strings except 'time' (a datetime object).
+        An optional 'location' key may also be present per sample.
         location: Optional study-site or household identifier to attach
-                  to the entire batch (separate from per-sample location).
+        to the entire batch (separate from per-sample location).
         retries:  How many times to retry on transient network errors.
-                  Client/auth errors and SSL failures are never retried.
+        Client/auth errors and SSL failures are never retried.
         timeout:  Seconds to wait for a server response before giving up.
 
     Returns:
