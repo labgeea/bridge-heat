@@ -99,7 +99,7 @@ async def fetch_data(hass: HomeAssistant, entry: ConfigEntry):
                 "time": datetime.utcfromtimestamp(r["last_updated_ts"]).strftime("%Y-%m-%d %H:%M:%S")
             })
             #with open("debug.txt", "w") as f:
-                f.write(f"{results}\n")
+                #f.write(f"{results}\n")
         return results
 
     # Run blocking SQLite query in a separate thread for asynchronous function
