@@ -3,7 +3,7 @@ from homeassistant import config_entries
 import voluptuous as vol
 from .const import *
 
-
+# Setting up User Permissions, modify as needed
 PERMS_SCHEMA = vol.Schema({
     vol.Optional(TEMP, default=False): bool,
     vol.Optional(HUMIDITY, default=False): bool,
@@ -38,6 +38,8 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
 
     async def async_step_init(self, user_input=None):
         return await self.async_step_options()
+
+# Modify this function to change the environmental variables needed
 
     async def async_step_options(self, user_input=None):
         if user_input is None:
