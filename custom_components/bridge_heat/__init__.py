@@ -30,7 +30,7 @@ async def async_setup(hass: HomeAssistant, config):
 async def fetch_data(hass: HomeAssistant, entry: ConfigEntry):
     def query_db():
         dicts = []
-        if entry.options.get(TEMP): # checking user permissions for each environmental variable
+        if entry.options.get(TEMP): # checking user permissions for each environmental variable, modify as needed
             dicts.append(TEMP_ATTR)
         if entry.options.get(PRESSURE):
             dicts.append(PRESSURE_ATTR)
