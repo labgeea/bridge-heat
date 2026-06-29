@@ -30,7 +30,8 @@ async def async_setup(hass: HomeAssistant, config):
 async def fetch_data(hass: HomeAssistant, entry: ConfigEntry):
     def query_db():
         dicts = []
-        if entry.options.get(TEMP): # checking user permissions for each environmental variable, modify as needed
+        # checking user permissions for each environmental variable, modify as needed
+        if entry.options.get(TEMP):
             dicts.append(TEMP_ATTR)
         if entry.options.get(PRESSURE):
             dicts.append(PRESSURE_ATTR)
@@ -51,8 +52,8 @@ async def fetch_data(hass: HomeAssistant, entry: ConfigEntry):
         for d in dicts:
             for k, v in d.items():
                 DICT.setdefault(k, []).append(v)
-
-        db_path = hass.config.path("home-assistant_v2.db") # connecting to the database and setting up the query
+        # connecting to the database and setting up the query
+        db_path = hass.config.path("home-assistant_v2.db")
         conn = sqlite3.connect(db_path)
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
@@ -98,8 +99,8 @@ async def fetch_data(hass: HomeAssistant, entry: ConfigEntry):
                 "state": state,
                 "time": datetime.utcfromtimestamp(r["last_updated_ts"]).strftime("%Y-%m-%d %H:%M:%S")
             })
-            #with open("debug.txt", "w") as f:
-                #f.write(f"{results}\n")
+            with open("debug.txt", "w") as f:
+                f.write(f"{results}\n")
         return results
 
     # Run blocking SQLite query in a separate thread for asynchronous function
@@ -109,8 +110,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     _LOGGER.info("Bridge Heat called")
 
     hass.data[DOMAIN][entry.entry_id] = {
-        "samples": []
-    }
+    "samples": [],
+    "status": "Waiting for first upload",
+    "last_upload": None,
+    "last_error": None,
+}
 
     await hass.config_entries.async_forward_entry_setups(
         entry,
@@ -118,20 +122,28 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     )
 
     async def upload_job(now):
-        samples = await fetch_data(hass, entry) # calls the data_fetching function into variable "samples", which is then called by the uploader function
+        samples = await fetch_data(hass, entry)
+        hass.data[DOMAIN][entry.entry_id]["samples"] = samples
 
         if not samples:
             _LOGGER.info("No Samples to Upload")
             return
 
         try:
+            hass.data[DOMAIN][entry.entry_id]["status"] = "Uploading"
             await send_data(samples)
 
             hass.data[DOMAIN][entry.entry_id]["samples"] = []
+            hass.data[DOMAIN][entry.entry_id]["status"] = "Idle"
+            hass.data[DOMAIN][entry.entry_id]["last_upload"] = dt_util.utcnow().isoformat()
+            hass.data[DOMAIN][entry.entry_id]["last_error"] = None
 
             _LOGGER.info("Upload successful")
 
         except Exception as err:
+            hass.data[DOMAIN][entry.entry_id]["status"] = "Upload failed"
+            hass.data[DOMAIN][entry.entry_id]["last_error"] = str(err)
+
             _LOGGER.error("Upload failed: %s", err)
 
     async def start_periodic_upload(now):
@@ -144,7 +156,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         )
 
         hass.data[DOMAIN][entry.entry_id]["remove_upload"] = remove_upload
-        
+
         await upload_job(now)
 
     # Pick random time between 12 AM and 6 AM
