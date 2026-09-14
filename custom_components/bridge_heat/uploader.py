@@ -4,7 +4,6 @@
 # (temperature, humidity, etc.) collected from participants' homes
 # to the BGU geo-sensors research server.
 
-import os
 import io
 import gzip
 import json
@@ -13,13 +12,10 @@ import aiohttp
 import logging
 from datetime import datetime
 from typing import Optional
+from .const import KEY, URL
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-SERVER_URL = "https://bgu-geo-sensors.com/upload/"
-
-API_KEY = os.environ.get("BRIDGE_HEAT_API_KEY")
 
 
 def _compress_payload_sync(payload: dict) -> bytes:
@@ -92,7 +88,7 @@ async def send_data(
     headers = {
         "Content-Type": "application/json",
         "Content-Encoding": "gzip",
-        "X-API-Key": API_KEY,
+        "X-API-Key": KEY,
     }
 
     client_timeout = aiohttp.ClientTimeout(total=timeout)
@@ -100,7 +96,7 @@ async def send_data(
     for attempt in range(1, retries + 1):
         try:
             async with aiohttp.ClientSession(timeout=client_timeout) as session:
-                async with session.post(SERVER_URL, data=compressed, headers=headers, ssl=True) as resp:
+                async with session.post(URL, data=compressed, headers=headers, ssl=False) as resp:
                     resp.raise_for_status()
                     logger.info(f"Data sent successfully on attempt {attempt}.")
                     return True

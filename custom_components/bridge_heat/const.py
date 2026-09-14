@@ -3,7 +3,7 @@ PLATFORMS = ["sensor"]
 
 UPLOAD_INTERVAL = 60 * 24 * 60 # seconds
 SAMPLE_INTERVAL = 60 * 24 * 60
-URL = "https://bridgeheat.mssm.edu/api/v1/env"
+URL = "http://142.93.68.156:8080/api/v1/env"
 KEY = "sb_secret_4jlAjWFgrbVh44Y_nkOvYw_Wj5D_gfU"
 
 TEMP = "Temperature"
