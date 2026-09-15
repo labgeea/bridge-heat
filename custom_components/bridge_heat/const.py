@@ -10,8 +10,8 @@ SAMPLE_INTERVAL = 60 * 24 * 60
 # Default is 60 seconds (1 minute), can be configured as needed
 POLL_INTERVAL = 60
 
-# Point to local Mac Laravel server for testing (change to production server when deploying)
-API_BASE_URL = "http://192.168.1.39:9003/api/v1"
+# Point to remote testing server (change to production server https://bridgeheat.mssm.edu/api/v1 when ready)
+API_BASE_URL = "http://142.93.68.156:8080/api/v1"
 URL = f"{API_BASE_URL}/env"
 PENDING_UPLOADS_URL = f"{API_BASE_URL}/pending-uploads"
 ACKNOWLEDGE_URL = f"{API_BASE_URL}/acknowledge-upload"
