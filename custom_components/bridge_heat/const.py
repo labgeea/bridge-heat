@@ -1,9 +1,20 @@
 DOMAIN = "bridge_heat"
 PLATFORMS = ["sensor"]
 
-UPLOAD_INTERVAL = 60 * 24 * 60 # seconds
+# Periodic scheduled upload interval (in seconds)
+# Set to 5 minutes for immediate testing (default production: 60 * 24 * 60)
+UPLOAD_INTERVAL = 60 * 5
 SAMPLE_INTERVAL = 60 * 24 * 60
-URL = "http://142.93.68.156:8080/api/v1/env"
+
+# Periodic poll interval for checking pending on-demand upload requests (in seconds)
+# Default is 60 seconds (1 minute), can be configured as needed
+POLL_INTERVAL = 60
+
+# Point to local Mac Laravel server for testing (change to production server when deploying)
+API_BASE_URL = "http://192.168.1.39:9003/api/v1"
+URL = f"{API_BASE_URL}/env"
+PENDING_UPLOADS_URL = f"{API_BASE_URL}/pending-uploads"
+ACKNOWLEDGE_URL = f"{API_BASE_URL}/acknowledge-upload"
 KEY = "sb_secret_4jlAjWFgrbVh44Y_nkOvYw_Wj5D_gfU"
 
 TEMP = "Temperature"

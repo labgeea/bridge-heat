@@ -6,7 +6,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.config_entries import ConfigEntry
 
 from .const import *
-from .uploader import send_data
+from .uploader import send_data, check_pending_uploads, acknowledge_upload
 
 import logging
 import sqlite3
@@ -17,11 +17,24 @@ from homeassistant.helpers.event import (
     async_call_later,
     async_track_time_interval,
 )
+from homeassistant.helpers import instance_id
 from homeassistant.util import dt as dt_util
 
 _LOGGER = logging.getLogger(__name__)
 
 _LOGGER.info("Integration loaded")
+
+
+async def get_device_id(hass: HomeAssistant, entry: ConfigEntry) -> str:
+    """Retrieve the permanent unique Home Assistant instance UUID."""
+    try:
+        uuid = await instance_id.async_get(hass)
+        if uuid:
+            return str(uuid)
+    except Exception as err:
+        _LOGGER.debug("Could not retrieve instance_id: %s", err)
+
+    return str(entry.entry_id)
 
 async def async_setup(hass: HomeAssistant, config):
     hass.data.setdefault(DOMAIN, {})
@@ -107,14 +120,16 @@ async def fetch_data(hass: HomeAssistant, entry: ConfigEntry):
     return await hass.async_add_executor_job(query_db)
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
-    _LOGGER.info("Bridge Heat called")
+    device_id = await get_device_id(hass, entry)
+    _LOGGER.info("Bridge Heat called (device_id: %s)", device_id)
 
     hass.data[DOMAIN][entry.entry_id] = {
-    "samples": [],
-    "status": "Waiting for first upload",
-    "last_upload": None,
-    "last_error": None,
-}
+        "device_id": device_id,
+        "samples": [],
+        "status": "Waiting for first upload",
+        "last_upload": None,
+        "last_error": None,
+    }
 
     await hass.config_entries.async_forward_entry_setups(
         entry,
@@ -129,16 +144,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
             _LOGGER.info("No Samples to Upload")
             return
 
+        latitude = hass.config.latitude
+        longitude = hass.config.longitude
+        location = f"{latitude}, {longitude}"
+
         try:
             hass.data[DOMAIN][entry.entry_id]["status"] = "Uploading"
-            await send_data(samples)
+            await send_data(samples, location=location, device_id=device_id)
 
             hass.data[DOMAIN][entry.entry_id]["samples"] = []
             hass.data[DOMAIN][entry.entry_id]["status"] = "Idle"
             hass.data[DOMAIN][entry.entry_id]["last_upload"] = dt_util.utcnow().isoformat()
             hass.data[DOMAIN][entry.entry_id]["last_error"] = None
 
-            _LOGGER.info("Upload successful")
+            _LOGGER.info("Upload successful (device_id: %s)", device_id)
 
         except Exception as err:
             hass.data[DOMAIN][entry.entry_id]["status"] = "Upload failed"
@@ -159,29 +178,73 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
 
         await upload_job(now)
 
-    # Pick random time between 12 AM and 6 AM
+    async def poll_pending_requests(now):
+        latitude = hass.config.latitude
+        longitude = hass.config.longitude
+        location = f"{latitude}, {longitude}"
 
-    now_local = dt_util.now()
+        try:
+            pending = await check_pending_uploads(device_id=device_id, location=location)
+            if not pending:
+                return
 
-    random_hour = random.randint(0, 5)
-    random_minute = random.randint(0, 59)
+            for req in pending:
+                req_id = req.get("id")
+                _LOGGER.info("Processing pending upload request #%s for location %s", req_id, location)
+                await acknowledge_upload(req_id, "acknowledged")
 
-    target_time = datetime.combine(
-        now_local.date(),
-        time(random_hour, random_minute),
-        tzinfo=now_local.tzinfo,
+                try:
+                    await upload_job(now)
+                    await acknowledge_upload(
+                        req_id,
+                        "completed",
+                        notes="Uploaded data successfully via on-demand trigger."
+                    )
+                except Exception as err:
+                    _LOGGER.error("On-demand upload execution failed for request #%s: %s", req_id, err)
+                    await acknowledge_upload(
+                        req_id,
+                        "failed",
+                        notes=f"Execution error: {err}"
+                    )
+        except Exception as err:
+            _LOGGER.debug("Error during pending upload check: %s", err)
+
+    # Start periodic polling for pending on-demand upload requests
+    _LOGGER.info("Starting on-demand upload polling every %ss", POLL_INTERVAL)
+    remove_poll = async_track_time_interval(
+        hass,
+        poll_pending_requests,
+        timedelta(seconds=POLL_INTERVAL),
     )
+    hass.data[DOMAIN][entry.entry_id]["remove_poll"] = remove_poll
 
-    # If today's random time already passed, use tomorrow
-    if target_time <= now_local:
-        target_time += timedelta(days=1)
+    # For testing or short intervals (<= 15 minutes), start first upload after 60 seconds
+    if UPLOAD_INTERVAL <= 900:
+        delay = 60
+        _LOGGER.info("Testing/short interval detected (%ss). First upload in %ss.", UPLOAD_INTERVAL, delay)
+    else:
+        # Pick random time between 12 AM and 6 AM
+        now_local = dt_util.now()
+        random_hour = random.randint(0, 5)
+        random_minute = random.randint(0, 59)
 
-    delay = (target_time - now_local).total_seconds()
+        target_time = datetime.combine(
+            now_local.date(),
+            time(random_hour, random_minute),
+            tzinfo=now_local.tzinfo,
+        )
 
-    _LOGGER.info(
-        "First upload scheduled for %s",
-        target_time.isoformat(),
-    )
+        # If today's random time already passed, use tomorrow
+        if target_time <= now_local:
+            target_time += timedelta(days=1)
+
+        delay = (target_time - now_local).total_seconds()
+
+        _LOGGER.info(
+            "First upload scheduled for %s",
+            target_time.isoformat(),
+        )
 
     remove_start = async_call_later(
         hass,
@@ -202,5 +265,8 @@ async def async_unload_entry(hass, entry):
 
     if data.get("remove_start"):
         data["remove_start"]()
+
+    if data.get("remove_poll"):
+        data["remove_poll"]()
 
     return True
