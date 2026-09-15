@@ -257,8 +257,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     return True
 
 
-async def async_unload_entry(hass, entry):
-    data = hass.data[DOMAIN].pop(entry.entry_id)
+async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+
+    data = hass.data[DOMAIN].pop(entry.entry_id, {})
 
     if data.get("remove_upload"):
         data["remove_upload"]()
@@ -269,4 +271,4 @@ async def async_unload_entry(hass, entry):
     if data.get("remove_poll"):
         data["remove_poll"]()
 
-    return True
+    return unload_ok
