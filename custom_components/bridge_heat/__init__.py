@@ -22,6 +22,54 @@ _LOGGER = logging.getLogger(__name__)
 
 _LOGGER.info("Bridge Heat Integration loaded")
 
+# Keywords that indicate non-environmental sensors (batteries, CPU, memory, power, etc.)
+EXCLUDED_KEYWORDS = (
+    "battery", "cpu", "processor", "memory", "disk", "swap", "load",
+    "storage", "ram", "gpu", "voltage", "current", "power", "signal",
+    "rssi", "linkquality", "illuminance", "energy", "consumption",
+    "uptime", "ping", "latency", "brightness", "speed", "volume",
+    "valve", "co2", "voc"
+)
+
+TEMP_UNITS = {"°c", "°f", "c", "f", "k"}
+PRESSURE_UNITS = {"psi", "pa", "kpa", "hpa", "mmhg", "inhg", "bar", "mbar"}
+
+
+def is_environmental_sensor(entity_id: str, attributes: dict, include_aq: bool = False) -> bool:
+    """Strictly verify whether an entity is an environmental sensor."""
+    ent = entity_id.lower()
+
+    # Must be a sensor
+    if not ent.startswith("sensor."):
+        return False
+
+    # Exclude system, battery, power, and diagnostics sensors
+    for kw in EXCLUDED_KEYWORDS:
+        if kw in ent:
+            return False
+
+    dc = str(attributes.get("device_class") or "").lower()
+    unit = str(attributes.get("unit_of_measurement") or "").strip().lower()
+
+    # Temperature
+    if dc == "temperature" or ("temp" in ent and unit in TEMP_UNITS):
+        return True
+
+    # Humidity (MUST be device_class humidity, or name contains 'hum' with '%' unit)
+    # Never match '%' alone without humidity indication
+    if dc == "humidity" or ("hum" in ent and unit == "%"):
+        return True
+
+    # Pressure
+    if dc == "pressure" or ("press" in ent and unit in PRESSURE_UNITS):
+        return True
+
+    # Air Quality (optional)
+    if include_aq and (dc == "aqi" or "aqi" in ent or "air_quality" in ent):
+        return True
+
+    return False
+
 
 async def get_device_id(hass: HomeAssistant, entry: ConfigEntry) -> str:
     """Retrieve the permanent unique Home Assistant instance UUID."""
@@ -50,47 +98,16 @@ async def async_setup(hass: HomeAssistant, config):
 
 
 async def fetch_data(hass: HomeAssistant, entry: ConfigEntry, force_sample_window: int = None):
-    # Temperature, Pressure, and Humidity are always collected by default for Bridge Heat
-    dicts = [TEMP_ATTR, PRESSURE_ATTR, HUMIDITY_ATTR]
-    # If Air Quality is enabled in options, include it as well
-    if entry.options.get(AQ, False):
-        dicts.append(AQ_ATTR)
-
-    names = []
-    device_classes = []
-    units = []
-    for d in dicts:
-        if "name" in d:
-            names.append(d["name"])
-        if "device_class" in d:
-            device_classes.append(d["device_class"].lower())
-        if "units_of_measurement" in d:
-            units.extend(d["units_of_measurement"])
-
+    include_aq = entry.options.get(AQ, False)
     last_upload_ts = hass.data.get(DOMAIN, {}).get(entry.entry_id, {}).get("last_upload_ts")
 
-    # Fast in-memory resolution of matching entities currently registered in HA state engine
+    # Fast in-memory resolution: identify actual environmental sensors currently active in HA
     matched_entity_ids = set()
     for state in hass.states.async_all():
-        entity_id = state.entity_id
-        matched = False
-        for pat in names:
-            fn_pat = pat.replace("%", "*")
-            if fnmatch.fnmatch(entity_id.lower(), fn_pat.lower()):
-                matched = True
-                break
-        if not matched and device_classes:
-            dc = state.attributes.get("device_class")
-            if dc and str(dc).lower() in device_classes:
-                matched = True
-        if not matched and units:
-            unit = state.attributes.get("unit_of_measurement")
-            if unit and unit in units:
-                matched = True
-        if matched:
-            matched_entity_ids.add(entity_id)
+        if is_environmental_sensor(state.entity_id, state.attributes, include_aq=include_aq):
+            matched_entity_ids.add(state.entity_id)
 
-    _LOGGER.info("Matched %d environmental entities in memory: %s", len(matched_entity_ids), list(matched_entity_ids)[:10])
+    _LOGGER.info("Identified %d environmental sensors in memory: %s", len(matched_entity_ids), list(matched_entity_ids))
 
     def query_db():
         # Open SQLite in URI read-only mode to prevent write-lock contention with HA Recorder
@@ -99,9 +116,9 @@ async def fetch_data(hass: HomeAssistant, entry: ConfigEntry, force_sample_windo
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
 
-        # Step 1: Look up metadata_id mappings from states_meta
         metadata_map = {}
 
+        # 1. Map in-memory identified entities to metadata_id
         if matched_entity_ids:
             chunk_size = 500
             ent_list = list(matched_entity_ids)
@@ -112,12 +129,15 @@ async def fetch_data(hass: HomeAssistant, entry: ConfigEntry, force_sample_windo
                 for r in cur.fetchall():
                     metadata_map[r["metadata_id"]] = r["entity_id"]
 
-        # Also match LIKE patterns in states_meta to catch any matching sensors in DB
-        if names:
-            name_clauses = " OR ".join(["entity_id LIKE ?" for _ in names])
-            cur.execute(f"SELECT metadata_id, entity_id FROM states_meta WHERE {name_clauses}", names)
-            for r in cur.fetchall():
-                metadata_map[r["metadata_id"]] = r["entity_id"]
+        # 2. Also search states_meta with targeted patterns, explicitly excluding battery/cpu/system keywords
+        exclude_clauses = " AND ".join([f"LOWER(entity_id) NOT LIKE '%{kw}%'" for kw in EXCLUDED_KEYWORDS])
+        cur.execute(f"""
+            SELECT metadata_id, entity_id FROM states_meta
+            WHERE (entity_id LIKE 'sensor.%temp%' OR entity_id LIKE 'sensor.%hum%' OR entity_id LIKE 'sensor.%press%')
+              AND {exclude_clauses}
+        """)
+        for r in cur.fetchall():
+            metadata_map[r["metadata_id"]] = r["entity_id"]
 
         if not metadata_map:
             conn.close()
@@ -138,7 +158,7 @@ async def fetch_data(hass: HomeAssistant, entry: ConfigEntry, force_sample_windo
 
         _LOGGER.info("Querying database for %d sensors since timestamp %s (current DB time: %s)", len(metadata_map), since_ts, db_now)
 
-        # Step 2: Query states using the composite index (metadata_id, last_updated_ts)
+        # Query states using the composite index (metadata_id, last_updated_ts)
         meta_ids = list(metadata_map.keys())
         meta_placeholders = ",".join(["?" for _ in meta_ids])
 
@@ -156,7 +176,7 @@ async def fetch_data(hass: HomeAssistant, entry: ConfigEntry, force_sample_windo
         rows = cur.fetchall()
         conn.close()
 
-        _LOGGER.info("Indexed query returned %d rows", len(rows))
+        _LOGGER.info("Indexed query returned %d rows for %d sensors", len(rows), len(meta_ids))
 
         latitude = hass.config.latitude
         longitude = hass.config.longitude
