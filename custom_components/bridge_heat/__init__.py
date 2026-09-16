@@ -22,13 +22,13 @@ _LOGGER = logging.getLogger(__name__)
 
 _LOGGER.info("Bridge Heat Integration loaded")
 
-# Keywords that indicate non-environmental sensors (batteries, CPU, memory, power, etc.)
+# Keywords that indicate non-environmental sensors (batteries, CPU, memory, power, backups, etc.)
 EXCLUDED_KEYWORDS = (
     "battery", "cpu", "processor", "memory", "disk", "swap", "load",
     "storage", "ram", "gpu", "voltage", "current", "power", "signal",
     "rssi", "linkquality", "illuminance", "energy", "consumption",
     "uptime", "ping", "latency", "brightness", "speed", "volume",
-    "valve", "co2", "voc"
+    "valve", "co2", "voc", "backup", "attempt", "timestamp"
 )
 
 TEMP_UNITS = {"°c", "°f", "c", "f", "k"}
@@ -43,7 +43,7 @@ def is_environmental_sensor(entity_id: str, attributes: dict, include_aq: bool =
     if not ent.startswith("sensor."):
         return False
 
-    # Exclude system, battery, power, and diagnostics sensors
+    # Exclude system, backup, diagnostic, and battery sensors
     for kw in EXCLUDED_KEYWORDS:
         if kw in ent:
             return False
@@ -51,17 +51,16 @@ def is_environmental_sensor(entity_id: str, attributes: dict, include_aq: bool =
     dc = str(attributes.get("device_class") or "").lower()
     unit = str(attributes.get("unit_of_measurement") or "").strip().lower()
 
-    # Temperature
-    if dc == "temperature" or ("temp" in ent and unit in TEMP_UNITS):
+    # Temperature (matches device_class temperature, or explicit _temp/temperature word with temperature unit)
+    if dc == "temperature" or (any(term in ent for term in ("_temp", ".temp", "temperature")) and unit in TEMP_UNITS):
         return True
 
-    # Humidity (MUST be device_class humidity, or name contains 'hum' with '%' unit)
-    # Never match '%' alone without humidity indication
-    if dc == "humidity" or ("hum" in ent and unit == "%"):
+    # Humidity (matches device_class humidity, or explicit _hum/humidity word with % unit)
+    if dc == "humidity" or (any(term in ent for term in ("_hum", ".hum", "humidity")) and unit == "%"):
         return True
 
     # Pressure
-    if dc == "pressure" or ("press" in ent and unit in PRESSURE_UNITS):
+    if dc == "pressure" or (any(term in ent for term in ("_press", ".press", "pressure", "barometer")) and unit in PRESSURE_UNITS):
         return True
 
     # Air Quality (optional)
@@ -129,11 +128,13 @@ async def fetch_data(hass: HomeAssistant, entry: ConfigEntry, force_sample_windo
                 for r in cur.fetchall():
                     metadata_map[r["metadata_id"]] = r["entity_id"]
 
-        # 2. Also search states_meta with targeted patterns, explicitly excluding battery/cpu/system keywords
+        # 2. Search states_meta with precise patterns (excluding backup/attempt/battery/system)
         exclude_clauses = " AND ".join([f"LOWER(entity_id) NOT LIKE '%{kw}%'" for kw in EXCLUDED_KEYWORDS])
         cur.execute(f"""
             SELECT metadata_id, entity_id FROM states_meta
-            WHERE (entity_id LIKE 'sensor.%temp%' OR entity_id LIKE 'sensor.%hum%' OR entity_id LIKE 'sensor.%press%')
+            WHERE (entity_id LIKE 'sensor.%temperature%' OR entity_id LIKE 'sensor.%_temp%' 
+                OR entity_id LIKE 'sensor.%humidity%' OR entity_id LIKE 'sensor.%_hum%' 
+                OR entity_id LIKE 'sensor.%pressure%' OR entity_id LIKE 'sensor.%_press%')
               AND {exclude_clauses}
         """)
         for r in cur.fetchall():
@@ -190,8 +191,13 @@ async def fetch_data(hass: HomeAssistant, entry: ConfigEntry, force_sample_windo
                     attrs = json.loads(r["shared_attrs"])
                 except (ValueError, TypeError, json.JSONDecodeError):
                     attrs = {}
-            state = str(r["state"])
             entity_id = metadata_map.get(r["metadata_id"], "unknown")
+
+            # Final validation check: strictly verify entity is a genuine environmental sensor
+            if not is_environmental_sensor(entity_id, attrs, include_aq=include_aq):
+                continue
+
+            state = str(r["state"])
             results.append({
                 "location": location,
                 "entity": entity_id,
