@@ -11,7 +11,7 @@ import asyncio
 import aiohttp
 import logging
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Tuple
 from urllib.parse import quote
 from .const import KEY, URL, PENDING_UPLOADS_URL, ACKNOWLEDGE_URL
 
@@ -41,55 +41,23 @@ async def send_data(
     location: Optional[str] = None,
     device_id: Optional[str] = None,
     retries: int = 3,
-    timeout: int = 10
-) -> bool:
+    timeout: int = 60,
+    chunk_size: int = 1500,
+) -> Tuple[bool, str]:
     """
-    Securely sends sensor data to the BGU geo-sensors server.
-
-    Args:
-        samples:  List of dicts containing sensor readings.
-        All values are strings except 'time' (a datetime object).
-        An optional 'location' key may also be present per sample.
-        location: Optional study-site or household identifier to attach
-        to the entire batch (separate from per-sample location).
-        device_id: Permanent unique Home Assistant instance UUID.
-        retries:  How many times to retry on transient network errors.
-        Client/auth errors and SSL failures are never retried.
-        timeout:  Seconds to wait for a server response before giving up.
+    Securely sends sensor data to the BGU geo-sensors server in chunked batches.
 
     Returns:
-        True if the server accepted the payload, False on any failure.
+        Tuple of (success: bool, message: str)
     """
 
     if not samples:
         logger.warning("No samples to send.")
-        return False
+        return False, "No samples to send."
 
-    payload = {
-        "samples": [
-            {
-                **sample,
-                "time": (
-                    sample["time"].isoformat()
-                    if isinstance(sample.get("time"), datetime)
-                    else sample.get("time")
-                ),
-            }
-            for sample in samples
-        ]
-    }
-
-    if device_id:
-        payload["device_id"] = device_id
-
-    if location:
-        payload["location"] = location
-
-    try:
-        compressed = await compress_payload(payload)
-    except (TypeError, ValueError, OSError) as e:
-        logger.error(f"Payload compression failed: {e}")
-        return False
+    total_samples = len(samples)
+    chunks = [samples[i:i + chunk_size] for i in range(0, total_samples, chunk_size)]
+    logger.info("Transmitting %d samples in %d chunk(s)...", total_samples, len(chunks))
 
     headers = {
         "Content-Type": "application/json",
@@ -99,50 +67,82 @@ async def send_data(
 
     client_timeout = aiohttp.ClientTimeout(total=timeout)
 
-    for attempt in range(1, retries + 1):
+    for chunk_idx, chunk in enumerate(chunks, 1):
+        payload = {
+            "samples": [
+                {
+                    **sample,
+                    "time": (
+                        sample["time"].isoformat()
+                        if isinstance(sample.get("time"), datetime)
+                        else str(sample.get("time"))
+                    ),
+                }
+                for sample in chunk
+            ]
+        }
+
+        if device_id:
+            payload["device_id"] = device_id
+
+        if location:
+            payload["location"] = location
+
         try:
-            async with aiohttp.ClientSession(timeout=client_timeout) as session:
-                async with session.post(URL, data=compressed, headers=headers, ssl=False) as resp:
-                    resp.raise_for_status()
-                    logger.info(f"Data sent successfully on attempt {attempt}.")
-                    return True
+            compressed = await compress_payload(payload)
+        except Exception as e:
+            logger.error("Payload compression failed for chunk %d: %s", chunk_idx, e)
+            return False, f"Payload compression failed: {e}"
 
-        except aiohttp.ClientSSLError:
-            # SSL error means the server's certificate is invalid or a
-            # man-in-the-middle attack is in progress. Never disable ssl=True
-            # as a workaround — that would expose participants' data.
-            logger.error("SSL verification failed. Do not disable SSL verification!")
-            return False
+        chunk_success = False
+        last_error = ""
 
-        except asyncio.TimeoutError:
-            logger.warning(f"Attempt {attempt} timed out.")
+        for attempt in range(1, retries + 1):
+            try:
+                async with aiohttp.ClientSession(timeout=client_timeout) as session:
+                    async with session.post(URL, data=compressed, headers=headers, ssl=False) as resp:
+                        resp_text = await resp.text()
+                        if resp.status in (200, 201):
+                            logger.info("Chunk %d/%d sent successfully on attempt %d.", chunk_idx, len(chunks), attempt)
+                            chunk_success = True
+                            break
+                        else:
+                            last_error = f"HTTP {resp.status}: {resp_text[:200]}"
+                            logger.error("Server returned HTTP %s on chunk %d: %s", resp.status, chunk_idx, resp_text)
+                            # Client error (4xx) means invalid request/payload, do not retry
+                            if 400 <= resp.status < 500:
+                                return False, f"Server rejected data (HTTP {resp.status}): {resp_text[:200]}"
 
-        except aiohttp.ClientResponseError as e:
-            logger.error(f"HTTP error: {e.status} - {e.message}")
-            # 4xx errors mean our request is wrong — retrying won't help.
-            if e.status in (400, 401, 403):
-                return False
+            except aiohttp.ClientSSLError:
+                logger.error("SSL verification failed.")
+                return False, "SSL verification failed."
 
-        except aiohttp.ClientError as e:
-            logger.error(f"Request failed: {e}")
+            except asyncio.TimeoutError:
+                last_error = f"Timeout ({timeout}s) waiting for server response"
+                logger.warning("Attempt %d on chunk %d timed out.", attempt, chunk_idx)
 
-        if attempt < retries:
-            await asyncio.sleep(2 ** attempt)
+            except aiohttp.ClientError as e:
+                last_error = f"Network error: {e}"
+                logger.error("Attempt %d on chunk %d failed: %s", attempt, chunk_idx, e)
 
-    logger.error("All retry attempts failed.")
-    return False
+            if attempt < retries:
+                await asyncio.sleep(2 ** attempt)
+
+        if not chunk_success:
+            logger.error("Chunk %d/%d failed after %d retries. Last error: %s", chunk_idx, len(chunks), retries, last_error)
+            return False, f"Upload failed on chunk {chunk_idx}/{len(chunks)}: {last_error}"
+
+    return True, f"Successfully uploaded {total_samples} samples across {len(chunks)} chunk(s)."
 
 
 async def check_pending_uploads(
     device_id: Optional[str] = None,
     location: Optional[str] = None,
-    timeout: int = 10
+    timeout: int = 15,
 ) -> list[dict]:
     """
     Poll the backend to check if any on-demand upload requests are pending
     for this device (by UUID and/or location).
-
-    Returns a list of pending request dicts, e.g. [{"id": 1, "device_id": "...", ...}]
     """
     client_timeout = aiohttp.ClientTimeout(total=timeout)
     headers = {
@@ -175,7 +175,7 @@ async def acknowledge_upload(
     request_id: int,
     status: str,
     notes: Optional[str] = None,
-    timeout: int = 10
+    timeout: int = 15,
 ) -> bool:
     """
     Acknowledge or update the status of an on-demand upload request
@@ -202,4 +202,3 @@ async def acknowledge_upload(
     except Exception as e:
         logger.error(f"Failed to acknowledge upload #{request_id}: {e}")
         return False
-

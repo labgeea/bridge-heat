@@ -210,7 +210,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
             _LOGGER.warning("No samples found to upload for device %s", device_id)
             if hass.data[DOMAIN][entry.entry_id]["status"] != "Uploading":
                 hass.data[DOMAIN][entry.entry_id]["status"] = "Idle"
-            return False, 0
+            return False, 0, "No sensor samples found in database for the requested window"
 
         latitude = hass.config.latitude
         longitude = hass.config.longitude
@@ -218,7 +218,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
 
         try:
             hass.data[DOMAIN][entry.entry_id]["status"] = "Uploading"
-            success = await send_data(samples, location=location, device_id=device_id)
+            success, msg = await send_data(samples, location=location, device_id=device_id)
 
             if success:
                 latest_ts = int(dt_util.utcnow().timestamp())
@@ -228,19 +228,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                 hass.data[DOMAIN][entry.entry_id]["last_upload"] = dt_util.utcnow().isoformat()
                 hass.data[DOMAIN][entry.entry_id]["last_error"] = None
 
-                _LOGGER.info("Upload successful (device_id: %s, %d samples)", device_id, len(samples))
-                return True, len(samples)
+                _LOGGER.info("Upload successful (device_id: %s, %d samples): %s", device_id, len(samples), msg)
+                return True, len(samples), msg
             else:
                 hass.data[DOMAIN][entry.entry_id]["status"] = "Upload failed"
-                hass.data[DOMAIN][entry.entry_id]["last_error"] = "Server rejected or failed to receive data"
-                _LOGGER.error("Upload failed (device_id: %s)", device_id)
-                return False, len(samples)
+                hass.data[DOMAIN][entry.entry_id]["last_error"] = msg
+                _LOGGER.error("Upload failed (device_id: %s): %s", device_id, msg)
+                return False, len(samples), msg
 
         except Exception as err:
             hass.data[DOMAIN][entry.entry_id]["status"] = "Upload failed"
             hass.data[DOMAIN][entry.entry_id]["last_error"] = str(err)
             _LOGGER.error("Upload failed: %s", err)
-            return False, len(samples)
+            return False, len(samples), str(err)
 
     hass.data[DOMAIN][entry.entry_id]["upload_job"] = upload_job
 
@@ -273,7 +273,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                 await acknowledge_upload(req_id, "acknowledged")
 
                 try:
-                    success, sample_count = await upload_job(now, force_sample_window=SAMPLE_INTERVAL)
+                    success, sample_count, detail_msg = await upload_job(now, force_sample_window=SAMPLE_INTERVAL)
                     if success and sample_count > 0:
                         await acknowledge_upload(
                             req_id,
@@ -290,7 +290,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                         await acknowledge_upload(
                             req_id,
                             "failed",
-                            notes="Upload failed: remote server did not accept data."
+                            notes=f"Upload of {sample_count} samples failed: {detail_msg}"
                         )
                 except Exception as err:
                     _LOGGER.error("On-demand upload execution failed for request #%s: %s", req_id, err)
