@@ -6,12 +6,12 @@ PLATFORMS = ["sensor"]
 UPLOAD_INTERVAL = 60 * 24 * 60
 SAMPLE_INTERVAL = 60 * 24 * 60
 
-# Periodic poll interval for checking pending on-demand upload requests from remote server (in seconds)
-# Kept at 60 seconds (1 minute) for responsive remote test uploads
+# Periodic poll interval for checking pending on-demand upload requests from production server (in seconds)
+# Kept at 60 seconds (1 minute) for responsive remote on-demand uploads
 POLL_INTERVAL = 60
 
-# Point to remote testing server (change to production server https://bridgeheat.mssm.edu/api/v1 when ready)
-API_BASE_URL = "http://142.93.68.156:8080/api/v1"
+# Official Production Server
+API_BASE_URL = "https://bridgeheat.mssm.edu/api/v1"
 URL = f"{API_BASE_URL}/env"
 PENDING_UPLOADS_URL = f"{API_BASE_URL}/pending-uploads"
 ACKNOWLEDGE_URL = f"{API_BASE_URL}/acknowledge-upload"
