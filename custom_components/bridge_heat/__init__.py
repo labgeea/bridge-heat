@@ -1,18 +1,13 @@
 import json
 import asyncio
+import fnmatch
+import logging
+import random
+import sqlite3
 from datetime import datetime, timedelta, time
 
 from homeassistant.core import HomeAssistant
 from homeassistant.config_entries import ConfigEntry
-
-from .const import *
-from .uploader import send_data, check_pending_uploads, acknowledge_upload
-
-import logging
-import sqlite3
-
-import random
-
 from homeassistant.helpers.event import (
     async_call_later,
     async_track_time_interval,
@@ -20,9 +15,12 @@ from homeassistant.helpers.event import (
 from homeassistant.helpers import instance_id
 from homeassistant.util import dt as dt_util
 
+from .const import *
+from .uploader import send_data, check_pending_uploads, acknowledge_upload
+
 _LOGGER = logging.getLogger(__name__)
 
-_LOGGER.info("Integration loaded")
+_LOGGER.info("Bridge Heat Integration loaded")
 
 
 async def get_device_id(hass: HomeAssistant, entry: ConfigEntry) -> str:
@@ -36,127 +34,163 @@ async def get_device_id(hass: HomeAssistant, entry: ConfigEntry) -> str:
 
     return str(entry.entry_id)
 
+
 async def async_setup(hass: HomeAssistant, config):
     hass.data.setdefault(DOMAIN, {})
+
+    async def handle_trigger_upload(call):
+        """Service to trigger data upload immediately (e.g. for testing)."""
+        _LOGGER.info("Manual upload triggered via service call")
+        for entry_id, entry_data in hass.data.get(DOMAIN, {}).items():
+            if isinstance(entry_data, dict) and "upload_job" in entry_data:
+                await entry_data["upload_job"](None, force_sample_window=SAMPLE_INTERVAL)
+
+    hass.services.async_register(DOMAIN, "upload_data", handle_trigger_upload)
     return True
 
-async def fetch_data(hass: HomeAssistant, entry: ConfigEntry):
+
+async def fetch_data(hass: HomeAssistant, entry: ConfigEntry, force_sample_window: int = None):
+    # Checking user permissions for environmental variables
+    dicts = []
+    if entry.options.get(TEMP, True):
+        dicts.append(TEMP_ATTR)
+    if entry.options.get(PRESSURE, True):
+        dicts.append(PRESSURE_ATTR)
+    if entry.options.get(HUMIDITY, True):
+        dicts.append(HUMIDITY_ATTR)
+    if entry.options.get(AQ, False):
+        dicts.append(AQ_ATTR)
+
+    if not dicts:
+        _LOGGER.info("No environmental sensor categories enabled in integration options")
+        return []
+
+    names = []
+    device_classes = []
+    units = []
+    for d in dicts:
+        if "name" in d:
+            names.append(d["name"])
+        if "device_class" in d:
+            device_classes.append(d["device_class"].lower())
+        if "units_of_measurement" in d:
+            units.extend(d["units_of_measurement"])
+
+    # Determine time window
+    now_ts = int(dt_util.utcnow().timestamp())
+    last_upload_ts = hass.data.get(DOMAIN, {}).get(entry.entry_id, {}).get("last_upload_ts")
+
+    if force_sample_window is not None:
+        # Forced test or on-demand request (e.g. past 24 hours)
+        since_ts = now_ts - force_sample_window
+    elif last_upload_ts and last_upload_ts > 0:
+        # Incremental: fetch only records created since last upload, capped at SAMPLE_INTERVAL (24h)
+        since_ts = max(int(last_upload_ts), now_ts - SAMPLE_INTERVAL)
+    else:
+        # Initial run: past 24 hours
+        since_ts = now_ts - SAMPLE_INTERVAL
+
+    # Fast in-memory resolution of matching entities currently registered in HA state engine
+    matched_entity_ids = set()
+    for state in hass.states.async_all():
+        entity_id = state.entity_id
+        matched = False
+        for pat in names:
+            fn_pat = pat.replace("%", "*")
+            if fnmatch.fnmatch(entity_id, fn_pat):
+                matched = True
+                break
+        if not matched and device_classes:
+            dc = state.attributes.get("device_class")
+            if dc and str(dc).lower() in device_classes:
+                matched = True
+        if not matched and units:
+            unit = state.attributes.get("unit_of_measurement")
+            if unit and unit in units:
+                matched = True
+        if matched:
+            matched_entity_ids.add(entity_id)
+
     def query_db():
-        dicts = []
-        # checking user permissions for each environmental variable, modify as needed
-        if entry.options.get(TEMP):
-            dicts.append(TEMP_ATTR)
-        if entry.options.get(PRESSURE):
-            dicts.append(PRESSURE_ATTR)
-        if entry.options.get(HUMIDITY):
-            dicts.append(HUMIDITY_ATTR)
-        if entry.options.get(AQ):
-            dicts.append(AQ_ATTR)
-        if entry.options.get(ENERGY):
-            dicts.append(ENERGY_ATTR)
-        if entry.options.get(HVAC):
-            dicts.append(HVAC_ATTR)
-        if entry.options.get(LIGHT):
-            dicts.append(LIGHT_ATTR)
-        if entry.options.get(NOISE):
-            dicts.append(NOISE_ATTR)
-
-        if not dicts:
-            _LOGGER.info("No sensor categories enabled in integration options")
-            return []
-
-        # Collect all name patterns, device classes, and units from enabled categories
-        names = []
-        device_classes = []
-        units = []
-        for d in dicts:
-            if "name" in d:
-                names.append(d["name"])
-            if "device_class" in d:
-                device_classes.append(d["device_class"])
-            if "units_of_measurement" in d:
-                units.extend(d["units_of_measurement"])
-
-        if not names and not device_classes and not units:
-            _LOGGER.info("No sensor matching criteria found")
-            return []
-
-        # connecting to the database and setting up the query
+        # Open SQLite in URI read-only mode to prevent any write-lock contention with HA Recorder
         db_path = hass.config.path("home-assistant_v2.db")
-        conn = sqlite3.connect(db_path)
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
 
-        # Build WHERE clause parts and params
-        where_parts = []
-        params = []
+        # Step 1: Look up metadata_id mappings from states_meta (only ~200 rows in table)
+        metadata_map = {}
 
-        # Entity name LIKE patterns (broadened: sensor.%temp%, sensor.%hum%, etc.)
+        if matched_entity_ids:
+            chunk_size = 500
+            ent_list = list(matched_entity_ids)
+            for i in range(0, len(ent_list), chunk_size):
+                chunk = ent_list[i:i + chunk_size]
+                placeholders = ",".join(["?" for _ in chunk])
+                cur.execute(f"SELECT metadata_id, entity_id FROM states_meta WHERE entity_id IN ({placeholders})", chunk)
+                for r in cur.fetchall():
+                    metadata_map[r["metadata_id"]] = r["entity_id"]
+
+        # Also match LIKE patterns in states_meta to catch any matching sensors in DB
         if names:
-            name_clause = " OR ".join(["m.entity_id LIKE ?" for _ in names])
-            where_parts.append(f"({name_clause})")
-            params.extend(names)
+            name_clauses = " OR ".join(["entity_id LIKE ?" for _ in names])
+            cur.execute(f"SELECT metadata_id, entity_id FROM states_meta WHERE {name_clauses}", names)
+            for r in cur.fetchall():
+                metadata_map[r["metadata_id"]] = r["entity_id"]
 
-        # Device class matching (case-insensitive)
-        if device_classes:
-            dc_clause = ",".join(["?" for _ in device_classes])
-            where_parts.append(f"LOWER(json_extract(a.shared_attrs, '$.device_class')) IN ({dc_clause})")
-            params.extend([dc.lower() for dc in device_classes])
+        if not metadata_map:
+            conn.close()
+            _LOGGER.info("No matching environmental sensor metadata found in database")
+            return []
 
-        # Unit of measurement matching
-        if units:
-            unit_clause = ",".join(["?" for _ in units])
-            where_parts.append(f"json_extract(a.shared_attrs, '$.unit_of_measurement') IN ({unit_clause})")
-            params.extend(units)
+        # Step 2: Query states using the composite index (metadata_id, last_updated_ts)
+        # Avoids full table scans and avoids evaluating json_extract() over the table
+        meta_ids = list(metadata_map.keys())
+        meta_placeholders = ",".join(["?" for _ in meta_ids])
 
-        where_combined = " OR ".join(where_parts)
-        params.append(SAMPLE_INTERVAL)
-
-        # Query: join states and metadata, filter sensors by name, device_class, or unit
-        query = f"""SELECT s.state, s.metadata_id, m.entity_id, a.shared_attrs, s.last_updated_ts
+        query = f"""SELECT s.state, s.metadata_id, a.shared_attrs, s.last_updated_ts
                 FROM states s
-                JOIN states_meta m
-                ON s.metadata_id = m.metadata_id
-                JOIN state_attributes a
+                LEFT JOIN state_attributes a
                 ON s.attributes_id = a.attributes_id
-                WHERE (
-                    {where_combined}
-                )
-                AND s.state NOT IN ('unknown', 'unavailable', '')
-                AND s.last_updated_ts >= strftime('%s','now') - ?
+                WHERE s.metadata_id IN ({meta_placeholders})
+                  AND s.state NOT IN ('unknown', 'unavailable', '')
+                  AND s.last_updated_ts >= ?
                 ORDER BY s.metadata_id, s.last_updated_ts;"""
 
-        _LOGGER.debug("Sensor query: %s", query)
-        _LOGGER.debug("Sensor params: %s", params)
+        params = meta_ids + [since_ts]
 
+        _LOGGER.debug("Indexed query for %d metadata IDs, since_ts: %s", len(meta_ids), since_ts)
         cur.execute(query, params)
         rows = cur.fetchall()
         conn.close()
 
-        _LOGGER.info("Query returned %d rows", len(rows))
+        _LOGGER.info("Indexed query returned %d rows (since timestamp %s)", len(rows), since_ts)
 
         latitude = hass.config.latitude
         longitude = hass.config.longitude
-        location = str(latitude) + ', ' + str(longitude)
+        location = f"{latitude}, {longitude}"
 
         results = []
         for r in rows:
-            try:
-                attrs = json.loads(r["shared_attrs"])
-            except (ValueError, TypeError, json.JSONDecodeError):
-                continue
+            attrs = {}
+            if r["shared_attrs"]:
+                try:
+                    attrs = json.loads(r["shared_attrs"])
+                except (ValueError, TypeError, json.JSONDecodeError):
+                    attrs = {}
             state = str(r["state"])
+            entity_id = metadata_map.get(r["metadata_id"], "unknown")
             results.append({
                 "location": location,
-                "entity": r["entity_id"],
+                "entity": entity_id,
                 "attributes": attrs,
                 "state": state,
                 "time": datetime.utcfromtimestamp(r["last_updated_ts"]).strftime("%Y-%m-%d %H:%M:%S")
             })
         return results
 
-    # Run blocking SQLite query in a separate thread for asynchronous function
     return await hass.async_add_executor_job(query_db)
+
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     device_id = await get_device_id(hass, entry)
@@ -167,6 +201,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         "samples": [],
         "status": "Waiting for first upload",
         "last_upload": None,
+        "last_upload_ts": None,
         "last_error": None,
     }
 
@@ -175,12 +210,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         PLATFORMS,
     )
 
-    async def upload_job(now):
-        samples = await fetch_data(hass, entry)
+    async def upload_job(now, force_sample_window: int = None):
+        samples = await fetch_data(hass, entry, force_sample_window=force_sample_window)
         hass.data[DOMAIN][entry.entry_id]["samples"] = samples
 
         if not samples:
             _LOGGER.info("No Samples to Upload")
+            if hass.data[DOMAIN][entry.entry_id]["status"] != "Uploading":
+                hass.data[DOMAIN][entry.entry_id]["status"] = "Idle"
             return
 
         latitude = hass.config.latitude
@@ -189,32 +226,40 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
 
         try:
             hass.data[DOMAIN][entry.entry_id]["status"] = "Uploading"
-            await send_data(samples, location=location, device_id=device_id)
+            success = await send_data(samples, location=location, device_id=device_id)
 
-            hass.data[DOMAIN][entry.entry_id]["samples"] = []
-            hass.data[DOMAIN][entry.entry_id]["status"] = "Idle"
-            hass.data[DOMAIN][entry.entry_id]["last_upload"] = dt_util.utcnow().isoformat()
-            hass.data[DOMAIN][entry.entry_id]["last_error"] = None
+            if success:
+                latest_ts = int(dt_util.utcnow().timestamp())
+                hass.data[DOMAIN][entry.entry_id]["last_upload_ts"] = latest_ts
+                hass.data[DOMAIN][entry.entry_id]["samples"] = []
+                hass.data[DOMAIN][entry.entry_id]["status"] = "Idle"
+                hass.data[DOMAIN][entry.entry_id]["last_upload"] = dt_util.utcnow().isoformat()
+                hass.data[DOMAIN][entry.entry_id]["last_error"] = None
 
-            _LOGGER.info("Upload successful (device_id: %s)", device_id)
+                _LOGGER.info("Upload successful (device_id: %s, %d samples)", device_id, len(samples))
+            else:
+                hass.data[DOMAIN][entry.entry_id]["status"] = "Upload failed"
+                hass.data[DOMAIN][entry.entry_id]["last_error"] = "Server rejected or failed to receive data"
+                _LOGGER.error("Upload failed (device_id: %s)", device_id)
 
         except Exception as err:
             hass.data[DOMAIN][entry.entry_id]["status"] = "Upload failed"
             hass.data[DOMAIN][entry.entry_id]["last_error"] = str(err)
-
             _LOGGER.error("Upload failed: %s", err)
 
+    hass.data[DOMAIN][entry.entry_id]["upload_job"] = upload_job
+
     async def start_periodic_upload(now):
-        _LOGGER.info("Starting periodic uploads")
+        _LOGGER.info("Starting periodic scheduled upload (interval: %ss)", UPLOAD_INTERVAL)
 
         remove_upload = async_track_time_interval(
             hass,
             upload_job,
-            timedelta(seconds = UPLOAD_INTERVAL),
+            timedelta(seconds=UPLOAD_INTERVAL),
         )
-
         hass.data[DOMAIN][entry.entry_id]["remove_upload"] = remove_upload
 
+        # Run scheduled upload
         await upload_job(now)
 
     async def poll_pending_requests(now):
@@ -233,7 +278,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                 await acknowledge_upload(req_id, "acknowledged")
 
                 try:
-                    await upload_job(now)
+                    # For on-demand test requests, force 24h sample window so tests always find data
+                    await upload_job(now, force_sample_window=SAMPLE_INTERVAL)
                     await acknowledge_upload(
                         req_id,
                         "completed",
@@ -258,7 +304,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     )
     hass.data[DOMAIN][entry.entry_id]["remove_poll"] = remove_poll
 
-    # For testing or short intervals (<= 15 minutes), start first upload after 60 seconds
+    # Schedule regular upload during off-peak night hours
     if UPLOAD_INTERVAL <= 900:
         delay = 60
         _LOGGER.info("Testing/short interval detected (%ss). First upload in %ss.", UPLOAD_INTERVAL, delay)
@@ -274,15 +320,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
             tzinfo=now_local.tzinfo,
         )
 
-        # If today's random time already passed, use tomorrow
         if target_time <= now_local:
             target_time += timedelta(days=1)
 
         delay = (target_time - now_local).total_seconds()
 
         _LOGGER.info(
-            "First upload scheduled for %s",
+            "First scheduled upload set for %s (in %.1f hours)",
             target_time.isoformat(),
+            delay / 3600.0,
         )
 
     remove_start = async_call_later(
@@ -290,7 +336,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         delay,
         start_periodic_upload,
     )
-
     hass.data[DOMAIN][entry.entry_id]["remove_start"] = remove_start
 
     return True

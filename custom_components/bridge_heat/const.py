@@ -2,12 +2,12 @@ DOMAIN = "bridge_heat"
 PLATFORMS = ["sensor"]
 
 # Periodic scheduled upload interval (in seconds)
-# Set to 5 minutes for immediate testing (default production: 60 * 24 * 60)
-UPLOAD_INTERVAL = 60 * 5
+# Production default: 24 hours (60 * 24 * 60 = 86400 seconds)
+UPLOAD_INTERVAL = 60 * 24 * 60
 SAMPLE_INTERVAL = 60 * 24 * 60
 
-# Periodic poll interval for checking pending on-demand upload requests (in seconds)
-# Default is 60 seconds (1 minute), can be configured as needed
+# Periodic poll interval for checking pending on-demand upload requests from remote server (in seconds)
+# Kept at 60 seconds (1 minute) for responsive remote test uploads
 POLL_INTERVAL = 60
 
 # Point to remote testing server (change to production server https://bridgeheat.mssm.edu/api/v1 when ready)
@@ -20,14 +20,10 @@ KEY = "sb_secret_4jlAjWFgrbVh44Y_nkOvYw_Wj5D_gfU"
 TEMP = "Temperature"
 HUMIDITY = "Humidity"
 PRESSURE = "Pressure"
-LIGHT = "Light"
-HVAC = "HVAC"
-ENERGY = "Energy"
-NOISE = "Noise"
 AQ = "Air Quality"
 PERMS_TITLE = "Permissions"
 
-# Broadened sensor name wildcards to match all hardware brands
+# Broadened sensor name wildcards to match environmental sensors across hardware brands
 # e.g. Aqara: sensor.lumi_lumi_weather_temperature
 #      Hue:   sensor.office_hue_temperature_temperature
 #      Sonoff: sensor.snzb_02_temperature
@@ -45,18 +41,6 @@ HUMIDITY_ATTR = {
     "name": "sensor.%hum%",
     "device_class": "humidity",
     "units_of_measurement": ["%"],
-}
-LIGHT_ATTR = {"name": "light.%"}
-HVAC_ATTR = {"name": "climate.%"}
-ENERGY_ATTR = {
-    "name": "sensor.%energy%",
-    "device_class": "energy",
-    "units_of_measurement": ["Wh", "kWh", "MWh"],
-}
-NOISE_ATTR = {
-    "name": "sensor.%noise%",
-    "device_class": "sound_pressure",
-    "units_of_measurement": ["dB", "dBA"],
 }
 AQ_ATTR = {
     "name": "sensor.%air_quality%",
