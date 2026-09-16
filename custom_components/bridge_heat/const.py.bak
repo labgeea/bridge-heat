@@ -26,40 +26,16 @@ ENERGY = "Energy"
 NOISE = "Noise"
 AQ = "Air Quality"
 PERMS_TITLE = "Permissions"
-
-# Broadened sensor name wildcards to match all hardware brands
-# e.g. Aqara: sensor.lumi_lumi_weather_temperature
-#      Hue:   sensor.office_hue_temperature_temperature
-#      Sonoff: sensor.snzb_02_temperature
-TEMP_ATTR = {
-    "name": "sensor.%temp%",
-    "device_class": "temperature",
-    "units_of_measurement": ["°C", "°F", "C", "F", "K"],
-}
-PRESSURE_ATTR = {
-    "name": "sensor.%press%",
-    "device_class": "pressure",
-    "units_of_measurement": ["psi", "Pa", "kPa", "hPa", "mmHg", "inHg", "bar", "mbar"],
-}
-HUMIDITY_ATTR = {
-    "name": "sensor.%hum%",
-    "device_class": "humidity",
-    "units_of_measurement": ["%"],
-}
-LIGHT_ATTR = {"name": "light.%"}
-HVAC_ATTR = {"name": "climate.%"}
-ENERGY_ATTR = {
-    "name": "sensor.%energy%",
-    "device_class": "energy",
-    "units_of_measurement": ["Wh", "kWh", "MWh"],
-}
-NOISE_ATTR = {
-    "name": "sensor.%noise%",
-    "device_class": "sound_pressure",
-    "units_of_measurement": ["dB", "dBA"],
-}
+TEMP_ATTR = {"name" : "sensor.%temperature%", "device_class" : 'temperature', "units_of_measurement" : ["°C", "°F", "K"]}
+PRESSURE_ATTR = {"name" : "sensor.%pressure%", "device_class" : 'pressure', "units_of_measurement" : ["psi", "Pa", "kPa", "hPa", "mmHg", "bar", "mbar"]}
+HUMIDITY_ATTR = {"name" : "sensor.%humidity%", "device_class" : 'humidity'}
+LIGHT_ATTR = {"name" : "light.%"}
+HVAC_ATTR = {"name" : "climate.%"}
+ENERGY_ATTR = {"name" : "sensor.%energy%", "device_class" : "energy", "units_of_measurement": ["Wh", "kWh", "MWh"]}
+NOISE_ATTR = {"name" : "sensor.%noise%", "device_class" : "sound_pressure", "units_of_measurement" : ["dB", "dBA"]}
 AQ_ATTR = {
     "name": "sensor.%air_quality%",
     "device_class": "aqi",
-    "units_of_measurement": ["AQI"],
+    "units_of_measurement": ["AQI"]
 }
+

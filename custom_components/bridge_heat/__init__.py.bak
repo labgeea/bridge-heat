@@ -60,83 +60,42 @@ async def fetch_data(hass: HomeAssistant, entry: ConfigEntry):
             dicts.append(LIGHT_ATTR)
         if entry.options.get(NOISE):
             dicts.append(NOISE_ATTR)
-
-        if not dicts:
-            _LOGGER.info("No sensor categories enabled in integration options")
-            return []
-
-        # Collect all name patterns, device classes, and units from enabled categories
-        names = []
-        device_classes = []
-        units = []
+        
+        DICT = {}
         for d in dicts:
-            if "name" in d:
-                names.append(d["name"])
-            if "device_class" in d:
-                device_classes.append(d["device_class"])
-            if "units_of_measurement" in d:
-                units.extend(d["units_of_measurement"])
-
-        if not names and not device_classes and not units:
-            _LOGGER.info("No sensor matching criteria found")
-            return []
-
+            for k, v in d.items():
+                DICT.setdefault(k, []).append(v)
         # connecting to the database and setting up the query
         db_path = hass.config.path("home-assistant_v2.db")
         conn = sqlite3.connect(db_path)
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
-
-        # Build WHERE clause parts and params
-        where_parts = []
-        params = []
-
-        # Entity name LIKE patterns (broadened: sensor.%temp%, sensor.%hum%, etc.)
-        if names:
-            name_clause = " OR ".join(["m.entity_id LIKE ?" for _ in names])
-            where_parts.append(f"({name_clause})")
-            params.extend(names)
-
-        # Device class matching (case-insensitive)
-        if device_classes:
-            dc_clause = ",".join(["?" for _ in device_classes])
-            where_parts.append(f"LOWER(json_extract(a.shared_attrs, '$.device_class')) IN ({dc_clause})")
-            params.extend([dc.lower() for dc in device_classes])
-
-        # Unit of measurement matching
-        if units:
-            unit_clause = ",".join(["?" for _ in units])
-            where_parts.append(f"json_extract(a.shared_attrs, '$.unit_of_measurement') IN ({unit_clause})")
-            params.extend(units)
-
-        where_combined = " OR ".join(where_parts)
-        params.append(SAMPLE_INTERVAL)
-
-        # Query: join states and metadata, filter sensors by name, device_class, or unit
+        CLAUSE = " OR ".join([f"m.entity_id LIKE ?" for _ in DICT['name']])
+        names = [DICT['name']]
+        device_class = [DICT['device_class']]
+        units = list(DICT['units_of_measurement'])
+        params_prelim = names + device_class + units + [[SAMPLE_INTERVAL]]
+        params = [item for sublist in params_prelim for item in sublist]
+        # Query: join states and metadata, filter sensors by unit in attributes
         query = f"""SELECT s.state, s.metadata_id, m.entity_id, a.shared_attrs, s.last_updated_ts
                 FROM states s
-                JOIN states_meta m
+                JOIN states_meta m 
                 ON s.metadata_id = m.metadata_id
                 JOIN state_attributes a
                 ON s.attributes_id = a.attributes_id
                 WHERE (
-                    {where_combined}
+                    {CLAUSE}
+                    OR json_extract(a.shared_attrs, '$.device_class') IN ({','.join(['?'] * len(DICT['device_class']))})
+                    OR json_extract(a.shared_attrs, '$.unit_of_measurement') IN ({','.join(['?'] * sum(len(sublist) for sublist in DICT['units_of_measurement']))})
                 )
-                AND s.state NOT IN ('unknown', 'unavailable', '')
                 AND s.last_updated_ts >= strftime('%s','now') - ?
                 ORDER BY s.metadata_id, s.last_updated_ts;"""
-
-        _LOGGER.debug("Sensor query: %s", query)
-        _LOGGER.debug("Sensor params: %s", params)
-
         cur.execute(query, params)
         rows = cur.fetchall()
         conn.close()
-
-        _LOGGER.info("Query returned %d rows", len(rows))
-
         latitude = hass.config.latitude
         longitude = hass.config.longitude
+
         location = str(latitude) + ', ' + str(longitude)
 
         results = []
@@ -153,6 +112,8 @@ async def fetch_data(hass: HomeAssistant, entry: ConfigEntry):
                 "state": state,
                 "time": datetime.utcfromtimestamp(r["last_updated_ts"]).strftime("%Y-%m-%d %H:%M:%S")
             })
+            with open("debug.txt", "w") as f:
+                f.write(f"{results}\n")
         return results
 
     # Run blocking SQLite query in a separate thread for asynchronous function
