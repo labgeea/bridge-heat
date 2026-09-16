@@ -50,20 +50,11 @@ async def async_setup(hass: HomeAssistant, config):
 
 
 async def fetch_data(hass: HomeAssistant, entry: ConfigEntry, force_sample_window: int = None):
-    # Checking user permissions for environmental variables
-    dicts = []
-    if entry.options.get(TEMP, True):
-        dicts.append(TEMP_ATTR)
-    if entry.options.get(PRESSURE, True):
-        dicts.append(PRESSURE_ATTR)
-    if entry.options.get(HUMIDITY, True):
-        dicts.append(HUMIDITY_ATTR)
+    # Temperature, Pressure, and Humidity are always collected by default for Bridge Heat
+    dicts = [TEMP_ATTR, PRESSURE_ATTR, HUMIDITY_ATTR]
+    # If Air Quality is enabled in options, include it as well
     if entry.options.get(AQ, False):
         dicts.append(AQ_ATTR)
-
-    if not dicts:
-        _LOGGER.info("No environmental sensor categories enabled in integration options")
-        return []
 
     names = []
     device_classes = []
@@ -76,19 +67,7 @@ async def fetch_data(hass: HomeAssistant, entry: ConfigEntry, force_sample_windo
         if "units_of_measurement" in d:
             units.extend(d["units_of_measurement"])
 
-    # Determine time window
-    now_ts = int(dt_util.utcnow().timestamp())
     last_upload_ts = hass.data.get(DOMAIN, {}).get(entry.entry_id, {}).get("last_upload_ts")
-
-    if force_sample_window is not None:
-        # Forced test or on-demand request (e.g. past 24 hours)
-        since_ts = now_ts - force_sample_window
-    elif last_upload_ts and last_upload_ts > 0:
-        # Incremental: fetch only records created since last upload, capped at SAMPLE_INTERVAL (24h)
-        since_ts = max(int(last_upload_ts), now_ts - SAMPLE_INTERVAL)
-    else:
-        # Initial run: past 24 hours
-        since_ts = now_ts - SAMPLE_INTERVAL
 
     # Fast in-memory resolution of matching entities currently registered in HA state engine
     matched_entity_ids = set()
@@ -97,7 +76,7 @@ async def fetch_data(hass: HomeAssistant, entry: ConfigEntry, force_sample_windo
         matched = False
         for pat in names:
             fn_pat = pat.replace("%", "*")
-            if fnmatch.fnmatch(entity_id, fn_pat):
+            if fnmatch.fnmatch(entity_id.lower(), fn_pat.lower()):
                 matched = True
                 break
         if not matched and device_classes:
@@ -111,14 +90,16 @@ async def fetch_data(hass: HomeAssistant, entry: ConfigEntry, force_sample_windo
         if matched:
             matched_entity_ids.add(entity_id)
 
+    _LOGGER.info("Matched %d environmental entities in memory: %s", len(matched_entity_ids), list(matched_entity_ids)[:10])
+
     def query_db():
-        # Open SQLite in URI read-only mode to prevent any write-lock contention with HA Recorder
+        # Open SQLite in URI read-only mode to prevent write-lock contention with HA Recorder
         db_path = hass.config.path("home-assistant_v2.db")
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
 
-        # Step 1: Look up metadata_id mappings from states_meta (only ~200 rows in table)
+        # Step 1: Look up metadata_id mappings from states_meta
         metadata_map = {}
 
         if matched_entity_ids:
@@ -140,11 +121,24 @@ async def fetch_data(hass: HomeAssistant, entry: ConfigEntry, force_sample_windo
 
         if not metadata_map:
             conn.close()
-            _LOGGER.info("No matching environmental sensor metadata found in database")
+            _LOGGER.warning("No matching environmental sensor metadata found in states_meta table!")
             return []
 
+        # Determine reference timestamp from SQLite itself to guarantee perfect time sync
+        cur.execute("SELECT strftime('%s', 'now');")
+        db_now_row = cur.fetchone()
+        db_now = int(db_now_row[0]) if db_now_row and db_now_row[0] else int(dt_util.utcnow().timestamp())
+
+        if force_sample_window is not None:
+            since_ts = db_now - force_sample_window
+        elif last_upload_ts and last_upload_ts > 0:
+            since_ts = max(int(last_upload_ts), db_now - SAMPLE_INTERVAL)
+        else:
+            since_ts = db_now - SAMPLE_INTERVAL
+
+        _LOGGER.info("Querying database for %d sensors since timestamp %s (current DB time: %s)", len(metadata_map), since_ts, db_now)
+
         # Step 2: Query states using the composite index (metadata_id, last_updated_ts)
-        # Avoids full table scans and avoids evaluating json_extract() over the table
         meta_ids = list(metadata_map.keys())
         meta_placeholders = ",".join(["?" for _ in meta_ids])
 
@@ -158,13 +152,11 @@ async def fetch_data(hass: HomeAssistant, entry: ConfigEntry, force_sample_windo
                 ORDER BY s.metadata_id, s.last_updated_ts;"""
 
         params = meta_ids + [since_ts]
-
-        _LOGGER.debug("Indexed query for %d metadata IDs, since_ts: %s", len(meta_ids), since_ts)
         cur.execute(query, params)
         rows = cur.fetchall()
         conn.close()
 
-        _LOGGER.info("Indexed query returned %d rows (since timestamp %s)", len(rows), since_ts)
+        _LOGGER.info("Indexed query returned %d rows", len(rows))
 
         latitude = hass.config.latitude
         longitude = hass.config.longitude
@@ -215,10 +207,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         hass.data[DOMAIN][entry.entry_id]["samples"] = samples
 
         if not samples:
-            _LOGGER.info("No Samples to Upload")
+            _LOGGER.warning("No samples found to upload for device %s", device_id)
             if hass.data[DOMAIN][entry.entry_id]["status"] != "Uploading":
                 hass.data[DOMAIN][entry.entry_id]["status"] = "Idle"
-            return
+            return False, 0
 
         latitude = hass.config.latitude
         longitude = hass.config.longitude
@@ -237,15 +229,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                 hass.data[DOMAIN][entry.entry_id]["last_error"] = None
 
                 _LOGGER.info("Upload successful (device_id: %s, %d samples)", device_id, len(samples))
+                return True, len(samples)
             else:
                 hass.data[DOMAIN][entry.entry_id]["status"] = "Upload failed"
                 hass.data[DOMAIN][entry.entry_id]["last_error"] = "Server rejected or failed to receive data"
                 _LOGGER.error("Upload failed (device_id: %s)", device_id)
+                return False, len(samples)
 
         except Exception as err:
             hass.data[DOMAIN][entry.entry_id]["status"] = "Upload failed"
             hass.data[DOMAIN][entry.entry_id]["last_error"] = str(err)
             _LOGGER.error("Upload failed: %s", err)
+            return False, len(samples)
 
     hass.data[DOMAIN][entry.entry_id]["upload_job"] = upload_job
 
@@ -278,13 +273,25 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                 await acknowledge_upload(req_id, "acknowledged")
 
                 try:
-                    # For on-demand test requests, force 24h sample window so tests always find data
-                    await upload_job(now, force_sample_window=SAMPLE_INTERVAL)
-                    await acknowledge_upload(
-                        req_id,
-                        "completed",
-                        notes="Uploaded data successfully via on-demand trigger."
-                    )
+                    success, sample_count = await upload_job(now, force_sample_window=SAMPLE_INTERVAL)
+                    if success and sample_count > 0:
+                        await acknowledge_upload(
+                            req_id,
+                            "completed",
+                            notes=f"Uploaded {sample_count} sensor samples successfully via on-demand trigger."
+                        )
+                    elif sample_count == 0:
+                        await acknowledge_upload(
+                            req_id,
+                            "completed",
+                            notes="On-demand trigger completed, but 0 sensor samples were found in the Home Assistant database for the past 24 hours."
+                        )
+                    else:
+                        await acknowledge_upload(
+                            req_id,
+                            "failed",
+                            notes="Upload failed: remote server did not accept data."
+                        )
                 except Exception as err:
                     _LOGGER.error("On-demand upload execution failed for request #%s: %s", req_id, err)
                     await acknowledge_upload(
