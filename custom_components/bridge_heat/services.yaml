@@ -1,0 +1,3 @@
+upload_data:
+  name: Upload Data
+  description: Triggers an immediate upload of environmental sensor data to the BridgeHeat server.
