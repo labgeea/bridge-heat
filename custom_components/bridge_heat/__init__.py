@@ -1,5 +1,6 @@
 import json
 import asyncio
+import uuid as uuid_lib
 import fnmatch
 import logging
 import random
@@ -71,11 +72,27 @@ def is_environmental_sensor(entity_id: str, attributes: dict, include_aq: bool =
 
 
 async def get_device_id(hass: HomeAssistant, entry: ConfigEntry) -> str:
-    """Retrieve the permanent unique Home Assistant instance UUID."""
+    """Generate a unique device ID from the hardware MAC address.
+
+    Even if the HA image/backup is cloned across multiple devices,
+    each physical device has a unique MAC address burned into its
+    network interface, guaranteeing a distinct device_id.
+    """
     try:
-        uuid = await instance_id.async_get(hass)
-        if uuid:
-            return str(uuid)
+        mac = uuid_lib.getnode()
+        # getnode() returns a 48-bit integer; format as 12-char hex
+        mac_hex = f"{mac:012x}"
+        device_id = f"ha-{mac_hex}"
+        _LOGGER.debug("Using hardware MAC-based device_id: %s", device_id)
+        return device_id
+    except Exception as err:
+        _LOGGER.warning("Could not read hardware MAC: %s, falling back to instance_id", err)
+
+    # Fallback to HA instance UUID if MAC is unavailable
+    try:
+        ha_uuid = await instance_id.async_get(hass)
+        if ha_uuid:
+            return str(ha_uuid)
     except Exception as err:
         _LOGGER.debug("Could not retrieve instance_id: %s", err)
 
